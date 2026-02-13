@@ -2,20 +2,27 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Forklift Simulator</title>
+    <title>Forklift Sim - First Person</title>
     <style>
-        body { margin: 0; overflow: hidden; background: #333; }
+        body { margin: 0; overflow: hidden; background: #000; }
         #ui {
             position: absolute; top: 20px; width: 100%; text-align: center;
-            color: white; font-family: monospace; font-size: 20px;
-            pointer-events: none; text-shadow: 2px 2px 0 #000;
+            color: #0f0; font-family: monospace; font-size: 20px;
+            pointer-events: none; text-shadow: 1px 1px 0 #000;
+        }
+        #instructions {
+            position: absolute; bottom: 20px; left: 20px;
+            color: rgba(255, 255, 255, 0.7); font-family: sans-serif;
+            pointer-events: none;
         }
     </style>
 </head>
 <body>
-    <div id="ui">
-        Wait for models to load...<br>
-        Arrows to Drive | SPACE to Lift
+    <div id="ui">INITIALIZING SYSTEMS...</div>
+    <div id="instructions">
+        WASD / Arrows to Drive<br>
+        SPACE to Lift/Drop Pallet<br>
+        L = Toggle Headlights
     </div>
 
     <script type="importmap">
@@ -32,149 +39,253 @@
         import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
         import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-        // --- GAME STATE (Prep for Multiplayer) ---
-        // We store data here. Later, we can send this "player" object 
-        // to a server so other people see you move.
-        const player = {
-            x: 0,
-            z: 0,
-            angle: 0,
-            speed: 0,
-            isLifting: false
+        // --- CONFIGURATION ---
+        const SETTINGS = {
+            turnSpeed: 0.03,
+            maxSpeed: 0.4,
+            acceleration: 0.01,
+            friction: 0.96,
+            liftSpeed: 0.1,
+            palletScale: 8.0, // Made pallet HUGE based on your feedback
+            cameraHeight: 2.8, // Driver eye level
+            cameraForward: 0.5 // Driver position forward/back
         };
 
-        // --- 1. SETUP SCENE ---
+        // --- SCENE SETUP ---
         const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x87CEEB); // Sky blue
-        scene.fog = new THREE.Fog(0x87CEEB, 10, 60);
+        scene.background = new THREE.Color(0x111111); // Dark industrial night
+        scene.fog = new THREE.Fog(0x111111, 10, 80);
 
-        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const camera = new THREE.PerspectiveCamera(85, window.innerWidth / window.innerHeight, 0.1, 1000);
+        
         const renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
         renderer.shadowMap.enabled = true;
         document.body.appendChild(renderer.domElement);
 
-        // Lights
-        const sun = new THREE.DirectionalLight(0xffffff, 2);
-        sun.position.set(10, 20, 10);
-        sun.castShadow = true;
-        scene.add(sun);
-        scene.add(new THREE.AmbientLight(0x404040));
+        // --- LIGHTS ---
+        const ambient = new THREE.AmbientLight(0x404040); // Soft moonlight
+        scene.add(ambient);
 
-        // Floor
+        const streetLight = new THREE.DirectionalLight(0xffffff, 0.5);
+        streetLight.position.set(20, 50, 20);
+        streetLight.castShadow = true;
+        scene.add(streetLight);
+
+        // Headlights (Spotlights attached to player later)
+        const headLight = new THREE.SpotLight(0xffffee, 100);
+        headLight.angle = 0.5;
+        headLight.penumbra = 0.3;
+        headLight.decay = 2;
+        headLight.distance = 50;
+        headLight.castShadow = true;
+        scene.add(headLight);
+        scene.add(headLight.target);
+
+        // --- ENVIRONMENT ---
+        // Concrete Floor
+        const textureLoader = new THREE.TextureLoader();
+        const grid = new THREE.GridHelper(200, 40, 0x333333, 0x111111);
+        scene.add(grid);
+        
         const floor = new THREE.Mesh(
             new THREE.PlaneGeometry(200, 200),
-            new THREE.MeshStandardMaterial({ color: 0x555555 })
+            new THREE.MeshStandardMaterial({ 
+                color: 0x222222, 
+                roughness: 0.8,
+                metalness: 0.2
+            })
         );
         floor.rotation.x = -Math.PI / 2;
         floor.receiveShadow = true;
         scene.add(floor);
 
-        // Grid
-        scene.add(new THREE.GridHelper(200, 50));
+        // --- VARIABLES ---
+        const player = {
+            group: new THREE.Group(),
+            speed: 0,
+            angle: 0,
+            liftHeight: 0, // 0 to 1 (percentage)
+            isCarrying: false
+        };
+        scene.add(player.group);
 
-        // --- 2. ASSET LOADING ---
-        const models = { forklift: null, pallet: null };
+        let forkliftMesh = null;
+        let palletMesh = null;
+        
+        // --- LOADING ASSETS ---
         const loadingMgr = new THREE.LoadingManager(() => {
-            document.getElementById('ui').innerHTML = "WASD / ARROWS to Drive | SPACE to Lift";
+            document.getElementById('ui').innerHTML = "SYSTEM ONLINE // DRIVER READY";
         });
 
-        // Load Forklift (OBJ)
+        // Load Forklift
         new OBJLoader(loadingMgr).load('Forklift.obj', (obj) => {
-            models.forklift = obj;
-            // Make it yellow and industrial
-            obj.traverse(child => {
+            forkliftMesh = obj;
+            
+            // 1. FIX ROTATION: Rotate the model -90 degrees (adjust if needed)
+            forkliftMesh.rotation.y = -Math.PI / 2; 
+            
+            // 2. PAINT JOB: Try to color wheels black and body orange
+            forkliftMesh.traverse((child) => {
                 if (child.isMesh) {
-                    child.material = new THREE.MeshStandardMaterial({ color: 0xffaa00, roughness: 0.6 });
                     child.castShadow = true;
+                    child.receiveShadow = true;
+                    
+                    // Simple logic: Small bounding boxes might be wheels/details
+                    child.geometry.computeBoundingBox();
+                    const size = new THREE.Vector3();
+                    child.geometry.boundingBox.getSize(size);
+                    
+                    if (size.y < 1.0) { 
+                        // Likely wheels or seat -> Dark Grey
+                        child.material = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.9 });
+                    } else {
+                        // Body -> Safety Orange
+                        child.material = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.4, metalness: 0.3 });
+                    }
                 }
             });
-            obj.scale.set(0.015, 0.015, 0.015); // Scale fix
-            scene.add(obj);
-        });
 
-        // Load Pallet (GLB)
-        new GLTFLoader(loadingMgr).load('Pallet.glb', (gltf) => {
-            models.pallet = gltf.scene;
-            models.pallet.position.set(5, 0, 5);
-            models.pallet.scale.set(1.5, 1.5, 1.5);
-            models.pallet.traverse(c => { if(c.isMesh) c.castShadow = true; });
-            scene.add(models.pallet);
-        });
-
-        // --- 3. INPUTS ---
-        const keys = {};
-        window.addEventListener('keydown', e => keys[e.code] = true);
-        window.addEventListener('keyup', e => {
-            keys[e.code] = false;
-            if (e.code === 'Space') attemptLift();
-        });
-
-        function attemptLift() {
-            if (!models.forklift || !models.pallet) return;
+            // Scale it down to reasonable size
+            forkliftMesh.scale.set(0.015, 0.015, 0.015);
             
-            if (player.isLifting) {
+            // Center it relative to parent
+            player.group.add(forkliftMesh);
+        });
+
+        // Load Pallet
+        new GLTFLoader(loadingMgr).load('Pallet.glb', (gltf) => {
+            palletMesh = gltf.scene;
+            
+            // 3. FIX SIZE: Make it massive
+            palletMesh.scale.set(SETTINGS.palletScale, SETTINGS.palletScale, SETTINGS.palletScale);
+            
+            palletMesh.position.set(10, 0, 10); // Start it somewhere on the floor
+            
+            palletMesh.traverse(c => { 
+                if(c.isMesh) {
+                    c.castShadow = true;
+                    // Make wood look like wood
+                    c.material = new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness: 1.0 });
+                }
+            });
+            scene.add(palletMesh);
+        });
+
+        // --- CONTROLS ---
+        const keys = { w: false, a: false, s: false, d: false, space: false };
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (keys.hasOwnProperty(key) || key === ' ') keys[key === ' ' ? 'space' : key] = true;
+            if (e.key === 'ArrowUp') keys.w = true;
+            if (e.key === 'ArrowDown') keys.s = true;
+            if (e.key === 'ArrowLeft') keys.a = true;
+            if (e.key === 'ArrowRight') keys.d = true;
+            
+            if (key === 'l') { // Toggle Lights
+                headLight.visible = !headLight.visible;
+            }
+        });
+        window.addEventListener('keyup', (e) => {
+            const key = e.key.toLowerCase();
+            if (keys.hasOwnProperty(key) || key === ' ') keys[key === ' ' ? 'space' : key] = false;
+            if (e.key === 'ArrowUp') keys.w = false;
+            if (e.key === 'ArrowDown') keys.s = false;
+            if (e.key === 'ArrowLeft') keys.a = false;
+            if (e.key === 'ArrowRight') keys.d = false;
+            
+            // Toggle Lift State on SPACE release (optional, here we use hold-to-lift or toggle logic)
+            if (e.code === 'Space') toggleLift();
+        });
+
+        function toggleLift() {
+            if (!forkliftMesh || !palletMesh) return;
+
+            if (player.isCarrying) {
                 // DROP
-                models.pallet.removeFromParent(); // Detach from forklift
-                scene.add(models.pallet); // Re-add to world
+                player.isCarrying = false;
                 
-                // Set position to where the forklift is + slight offset
-                models.pallet.position.copy(models.forklift.position);
-                models.pallet.translateZ(2); // Drop slightly in front
-                models.pallet.position.y = 0; // On floor
-                models.pallet.rotation.set(0, player.angle, 0);
+                // Convert world position back to scene
+                const worldPos = new THREE.Vector3();
+                palletMesh.getWorldPosition(worldPos);
                 
-                player.isLifting = false;
+                palletMesh.removeFromParent(); // Detach from player
+                scene.add(palletMesh); // Add back to world
+                
+                palletMesh.position.copy(worldPos);
+                palletMesh.rotation.set(0, player.angle, 0); // Align to drop angle
+                palletMesh.position.y = 0; // Snap to floor
+                
             } else {
-                // PICK UP
-                const dist = models.forklift.position.distanceTo(models.pallet.position);
-                if (dist < 4) { // If close enough
-                    models.forklift.add(models.pallet);
-                    models.pallet.position.set(0, 100, 150); // Relative to forklift (up and forward)
-                    models.pallet.rotation.set(0, 0, 0);
-                    player.isLifting = true;
+                // PICK UP CHECK
+                const playerPos = player.group.position;
+                const palletPos = palletMesh.position;
+                const dist = playerPos.distanceTo(palletPos);
+                
+                // If we are close (distance < 6)
+                if (dist < 6) {
+                    player.isCarrying = true;
+                    player.group.add(palletMesh); // Attach to player
+                    palletMesh.rotation.set(0, Math.PI, 0); // Align with forks
+                    // Initial "Fork" position
+                    palletMesh.position.set(0, 0.5, 3.5); 
                 }
             }
         }
 
-        // --- 4. GAME LOOP ---
+        // --- ANIMATION LOOP ---
         function animate() {
             requestAnimationFrame(animate);
 
-            if (models.forklift) {
-                // Physics Logic
-                if (keys['ArrowUp'] || keys['KeyW']) player.speed += 0.01;
-                else if (keys['ArrowDown'] || keys['KeyS']) player.speed -= 0.01;
-                else player.speed *= 0.95; // Friction
+            if (forkliftMesh) {
+                // 1. PHYSICS
+                if (keys.w) player.speed += SETTINGS.acceleration;
+                else if (keys.s) player.speed -= SETTINGS.acceleration;
+                else player.speed *= SETTINGS.friction;
 
-                // Cap speed
-                player.speed = Math.max(Math.min(player.speed, 0.3), -0.2);
+                player.speed = Math.max(Math.min(player.speed, SETTINGS.maxSpeed), -SETTINGS.maxSpeed / 2);
 
                 if (Math.abs(player.speed) > 0.01) {
-                    if (keys['ArrowLeft'] || keys['KeyA']) player.angle += 0.04;
-                    if (keys['ArrowRight'] || keys['KeyD']) player.angle -= 0.04;
+                    if (keys.a) player.angle += SETTINGS.turnSpeed; // Invert these if steering is backwards
+                    if (keys.d) player.angle -= SETTINGS.turnSpeed;
                 }
 
-                // Update Visuals based on Data
-                player.x += Math.sin(player.angle) * player.speed;
-                player.z += Math.cos(player.angle) * player.speed;
+                // Apply Movement
+                player.group.position.x += Math.sin(player.angle) * player.speed;
+                player.group.position.z += Math.cos(player.angle) * player.speed;
+                player.group.rotation.y = player.angle;
 
-                models.forklift.position.set(player.x, 0, player.z);
-                models.forklift.rotation.y = player.angle;
+                // 2. CAMERA (First Person)
+                // Calculate where the driver's head is
+                const offset = new THREE.Vector3(0, SETTINGS.cameraHeight, SETTINGS.cameraForward);
+                offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), player.angle);
+                const cameraPos = player.group.position.clone().add(offset);
+                
+                // Smooth camera movement
+                camera.position.lerp(cameraPos, 0.5);
+                
+                // Look forward relative to forklift
+                const lookTarget = new THREE.Vector3(0, 2, 20); // Look 20 units ahead
+                lookTarget.applyAxisAngle(new THREE.Vector3(0, 1, 0), player.angle);
+                camera.lookAt(player.group.position.clone().add(lookTarget));
 
-                // Camera Follow
-                const camOffset = new THREE.Vector3(0, 8, -12); // Behind and up
-                camOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), player.angle);
-                camera.position.lerp(models.forklift.position.clone().add(camOffset), 0.1);
-                camera.lookAt(models.forklift.position);
+                // 3. HEADLIGHTS
+                headLight.position.copy(camera.position);
+                headLight.target.position.copy(player.group.position.clone().add(lookTarget));
+
+                // 4. LIFT VISUALS
+                if (player.isCarrying) {
+                    // If carrying, we can raise/lower the pallet with keys (optional) or just keep it raised
+                    // Let's make it float up slightly to show it's lifted
+                    palletMesh.position.y = THREE.MathUtils.lerp(palletMesh.position.y, 1.5, 0.1);
+                }
             }
 
             renderer.render(scene, camera);
         }
 
         animate();
-        
-        // Handle window resize
+
         window.addEventListener('resize', () => {
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
